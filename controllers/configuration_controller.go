@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -182,11 +183,19 @@ func (r *ConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 		}
 
-		if err := r.terraformDestroy(ctx, configuration, meta); err != nil {
-			if err.Error() == types.MessageDestroyJobNotCompleted {
-				return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		// If no tfState has been generated, then perform a quick cleanup without dispatching destroying job.
+		if meta.isTFStateGenerated(ctx) {
+			if err := r.terraformDestroy(ctx, configuration, meta); err != nil {
+				if err.Error() == types.MessageDestroyJobNotCompleted {
+					return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+				}
+				return ctrl.Result{RequeueAfter: 3 * time.Second}, errors.Wrap(err, "continue reconciling to destroy cloud resource")
 			}
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, errors.Wrap(err, "continue reconciling to destroy cloud resource")
+		} else {
+			klog.Infof("No need to execute terraform destroy command, because tfstate file not found: %s/%s", configuration.Namespace, configuration.Name)
+			if err := r.cleanUpSubResources(ctx, configuration, meta); err != nil {
+				klog.Warningf("Ignoring error when clean up sub-resources, for no resource is actually created: %s", err)
+			}
 		}
 
 		configuration, err := tfcfg.Get(ctx, r.Client, req.NamespacedName)
@@ -288,6 +297,9 @@ type TFConfigurationMeta struct {
 	TerraformImage string
 	BusyboxImage   string
 	GitImage       string
+
+	// BackoffLimit specifies the number of retries to mark the Job as failed
+	BackoffLimit int32
 
 	// ResourceQuota series Variables are for Setting Compute Resources required by this container
 	ResourceQuota ResourceQuota
@@ -561,6 +573,13 @@ func (r *ConfigurationReconciler) preCheck(ctx context.Context, configuration *v
 		meta.GitImage = "alpine/git:latest"
 	}
 
+	meta.BackoffLimit = math.MaxInt32
+	if backoffLimit := os.Getenv("JOB_BACKOFF_LIMIT"); backoffLimit != "" {
+		if backoffLimitNumber, parserErr := strconv.ParseInt(backoffLimit, 10, 32); parserErr == nil {
+			meta.BackoffLimit = int32(backoffLimitNumber)
+		}
+	}
+
 	if err := r.preCheckResourcesSetting(meta); err != nil {
 		return err
 	}
@@ -724,6 +743,21 @@ func (meta *TFConfigurationMeta) validateSecretAndConfigMap(ctx context.Context,
 				}
 				return errors.New(msg)
 			}
+			// fix: The configmap or secret that the pod restricts from mounting must be in the same namespace as the pod,
+			//      otherwise the volume mount will fail.
+			if object.GetNamespace() != meta.ControllerNamespace {
+				objectKind := "ConfigMap"
+				if check.isSecret {
+					objectKind = "Secret"
+				}
+				msg := fmt.Sprintf("Invalid %s '%s/%s', whose namespace '%s' is different from the Configuration, cannot mount the volume,"+
+					" you can fix this issue by creating the Secret/ConfigMap in the '%s' namespace.",
+					objectKind, object.GetNamespace(), object.GetName(), meta.ControllerNamespace, meta.ControllerNamespace)
+				if updateStatusErr := meta.updateApplyStatus(ctx, k8sClient, check.notFoundState, msg); updateStatusErr != nil {
+					return errors.Wrap(updateStatusErr, msg)
+				}
+				return errors.New(msg)
+			}
 		}
 	}
 	return nil
@@ -811,7 +845,6 @@ func (meta *TFConfigurationMeta) assembleTerraformJob(executionType TerraformExe
 		initContainers          []v1.Container
 		parallelism             int32 = 1
 		completions             int32 = 1
-		backoffLimit            int32 = math.MaxInt32
 	)
 
 	executorVolumes := meta.assembleExecutorVolumes()
@@ -980,7 +1013,7 @@ func (meta *TFConfigurationMeta) assembleTerraformJob(executionType TerraformExe
 		Spec: batchv1.JobSpec{
 			Parallelism:  &parallelism,
 			Completions:  &completions,
-			BackoffLimit: &backoffLimit,
+			BackoffLimit: &meta.BackoffLimit,
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
@@ -1104,6 +1137,24 @@ func (tp *TfStateProperty) ToProperty() (v1beta2.Property, error) {
 // TFState is Terraform State
 type TFState struct {
 	Outputs map[string]TfStateProperty `json:"outputs"`
+}
+
+func (meta *TFConfigurationMeta) isTFStateGenerated(ctx context.Context) bool {
+	// 1. exist backend
+	if meta.Backend == nil {
+		return false
+	}
+	// 2. and exist tfstate file
+	tfStateJSON, err := meta.Backend.GetTFStateJSON(ctx)
+	if err != nil {
+		return false
+	}
+	// 3. and outputs not empty
+	var tfState TFState
+	if err = json.Unmarshal(tfStateJSON, &tfState); err != nil {
+		return false
+	}
+	return len(tfState.Outputs) > 0
 }
 
 //nolint:funlen
